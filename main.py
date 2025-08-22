@@ -1,26 +1,22 @@
-# Combined Proxy Checker Bot - Render Webhook Deployment
+# Combined Proxy Checker Bot - Render Webhook Deployment (Fixed)
 import aiohttp
 import asyncio
 import time
 import json
 import random
-from pathlib import Path
 import threading
 from urllib.parse import urlparse
 import io
-import tempfile
 import os
 from datetime import datetime
 import logging
 import traceback
 import requests
 from flask import Flask, request, jsonify
-import concurrent.futures
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from telegram.constants import ParseMode
 
 # Bot configuration - Use environment variables for security
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -63,7 +59,7 @@ def health_check():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Webhook endpoint for Telegram"""
+    """Webhook endpoint for Telegram - Fixed for synchronous handling"""
     try:
         if not bot_application:
             logger.error("Bot application not ready")
@@ -77,7 +73,7 @@ def webhook():
         if not update:
             return "Invalid update", 400
             
-        # Process update in background
+        # Process update in background thread to avoid blocking
         def process_update():
             try:
                 loop = asyncio.new_event_loop()
@@ -91,7 +87,6 @@ def webhook():
                 except:
                     pass
         
-        # Use thread pool to handle updates
         thread = threading.Thread(target=process_update)
         thread.daemon = True
         thread.start()
@@ -140,18 +135,16 @@ class EnhancedResidentialChecker:
         self.lock = threading.Lock()
         self.start_time = time.time()
         
-        # Settings optimized for Render
-        self.timeout = 8
-        self.max_concurrent = 25  # Reduced for stability
+        # Settings optimized for Render stability
+        self.timeout = 6
+        self.max_concurrent = 12
         self.test_url = "http://httpbin.org/ip"
-        self.chunk_size = 40
+        self.chunk_size = 20
         
-        # Real browser user agents
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
         ]
 
     def parse_proxy(self, proxy_line):
@@ -160,34 +153,28 @@ class EnhancedResidentialChecker:
         if not proxy_line or proxy_line.startswith('#'):
             return None
         
-        # Remove (Http) prefix if present
         if proxy_line.startswith('(Http)'):
             proxy_line = proxy_line[6:].strip()
         
         try:
-            # Format: http://host:port
             if proxy_line.startswith(('http://', 'https://')):
                 return proxy_line
             
-            # Format: socks5://host:port (convert to http)
             if proxy_line.startswith('socks5://'):
                 socks_part = proxy_line[9:]
                 return f"http://{socks_part}"
             
-            # Format: user:pass@host:port
             if '@' in proxy_line and proxy_line.count(':') >= 3:
                 auth_part, host_port = proxy_line.split('@', 1)
                 username, password = auth_part.split(':', 1)
                 return f"http://{username}:{password}@{host_port}"
             
-            # Format: IP:PORT:USERNAME:PASSWORD
             parts = proxy_line.split(':')
             if len(parts) >= 4:
                 host, port, username = parts[0], parts[1], parts[2]
                 password = ':'.join(parts[3:])
                 return f"http://{username}:{password}@{host}:{port}"
             
-            # Format: IP:PORT
             elif len(parts) == 2:
                 host, port = parts[0], parts[1]
                 return f"http://{host}:{port}"
@@ -211,10 +198,8 @@ class EnhancedResidentialChecker:
             'User-Agent': random.choice(self.user_agents),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
             'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         }
 
     async def analyze_proxy_quality(self, session, proxy, ip_address):
@@ -222,21 +207,18 @@ class EnhancedResidentialChecker:
         quality_score = 0
         analysis_data = {}
         
-        # Basic IP validation
         ip_parts = ip_address.split('.')
         if len(ip_parts) != 4:
             return 0, {}
         
         try:
-            # Use IP-API for comprehensive analysis
             url = f'http://ip-api.com/json/{ip_address}?fields=status,country,regionName,city,isp,org,as,proxy,hosting,mobile'
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get('status') == 'success':
                         analysis_data = data
                         
-                        # Scoring system
                         if not data.get('hosting', True):
                             quality_score += 30
                         
@@ -246,7 +228,6 @@ class EnhancedResidentialChecker:
                         if data.get('mobile', False):
                             quality_score += 25
                         
-                        # ISP analysis
                         isp = data.get('isp', '').lower()
                         residential_keywords = [
                             'comcast', 'verizon', 'att', 'charter', 'cox', 'spectrum', 'xfinity',
@@ -264,7 +245,7 @@ class EnhancedResidentialChecker:
                         elif any(keyword in isp for keyword in datacenter_keywords):
                             quality_score -= 25
             
-            await asyncio.sleep(1.2)  # Rate limiting
+            await asyncio.sleep(2.5)  # Rate limiting
             
         except Exception as e:
             logger.debug(f"IP analysis failed for {ip_address}: {e}")
@@ -278,7 +259,7 @@ class EnhancedResidentialChecker:
                 start_time = time.time()
                 headers = self.get_random_headers()
                 
-                timeout_config = aiohttp.ClientTimeout(total=self.timeout, connect=self.timeout/2)
+                timeout_config = aiohttp.ClientTimeout(total=self.timeout, connect=3)
                 
                 async with session.get(
                     self.test_url,
@@ -293,26 +274,25 @@ class EnhancedResidentialChecker:
                     
                     response_time = round((time.time() - start_time) * 1000, 2)
                     
-                    # Extract IP
                     try:
                         data = await response.json()
                         ip_address = data.get('origin', '').split(',')[0].strip()
                     except:
-                        ip_address = (await response.text()).strip()
+                        try:
+                            ip_address = (await response.text()).strip()
+                        except:
+                            ip_address = ""
                     
                     if not ip_address:
                         return proxy, False, 0, None, "No IP extracted"
                     
-                    # Analyze quality
                     quality_score, analysis_data = await self.analyze_proxy_quality(session, proxy, ip_address)
                     
-                    # Speed bonus
                     if response_time < 1000:
                         quality_score += 10
                     elif response_time < 2000:
                         quality_score += 5
                     
-                    # Premium threshold
                     is_premium = quality_score >= 35
                     
                     result_data = {
@@ -348,7 +328,7 @@ class EnhancedResidentialChecker:
             enable_cleanup_closed=True
         )
         
-        timeout_config = aiohttp.ClientTimeout(total=self.timeout)
+        timeout_config = aiohttp.ClientTimeout(total=self.timeout * 2)
         
         async with aiohttp.ClientSession(
             connector=connector,
@@ -383,7 +363,7 @@ class EnhancedResidentialChecker:
                         
                         self.session['checked_count'] = self.checked_count
                         
-                        if self.checked_count % 10 == 0:
+                        if self.checked_count % 5 == 0:
                             try:
                                 await self.send_progress_update()
                             except Exception as e:
@@ -391,6 +371,8 @@ class EnhancedResidentialChecker:
                                 
                 except Exception as task_error:
                     logger.error(f"Task error: {task_error}")
+                    with self.lock:
+                        self.checked_count += 1
                     continue
 
     async def send_progress_update(self):
@@ -454,7 +436,7 @@ Status: Analyzing proxy quality..."""
                 continue
             
             if i < len(chunks) - 1:
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
 
 
 class FastProxyChecker:
@@ -467,11 +449,10 @@ class FastProxyChecker:
         self.lock = threading.Lock()
         self.start_time = time.time()
         
-        # Settings optimized for speed but stable
-        self.timeout = 5
-        self.max_concurrent = 40
+        self.timeout = 4
+        self.max_concurrent = 15
         self.test_url = "http://httpbin.org/ip"
-        self.chunk_size = 150
+        self.chunk_size = 30
         
     def parse_proxy(self, proxy_line):
         """Parse all different proxy formats"""
@@ -479,34 +460,28 @@ class FastProxyChecker:
         if not proxy_line or proxy_line.startswith('#'):
             return None
         
-        # Remove (Http) prefix if present
         if proxy_line.startswith('(Http)'):
             proxy_line = proxy_line[6:].strip()
         
         try:
-            # Format: http://host:port
             if proxy_line.startswith(('http://', 'https://')):
                 return proxy_line
             
-            # Format: socks5://host:port (convert to http)
             if proxy_line.startswith('socks5://'):
                 socks_part = proxy_line[9:]
                 return f"http://{socks_part}"
             
-            # Format: user:pass@host:port
             if '@' in proxy_line and proxy_line.count(':') >= 3:
                 auth_part, host_port = proxy_line.split('@', 1)
                 username, password = auth_part.split(':', 1)
                 return f"http://{username}:{password}@{host_port}"
             
-            # Format: IP:PORT:USERNAME:PASSWORD
             parts = proxy_line.split(':')
             if len(parts) >= 4:
                 host, port, username = parts[0], parts[1], parts[2]
                 password = ':'.join(parts[3:])
                 return f"http://{username}:{password}@{host}:{port}"
             
-            # Format: IP:PORT
             elif len(parts) == 2:
                 host, port = parts[0], parts[1]
                 return f"http://{host}:{port}"
@@ -530,7 +505,7 @@ class FastProxyChecker:
             try:
                 start_time = time.time()
                 
-                timeout_config = aiohttp.ClientTimeout(total=self.timeout, connect=self.timeout/2)
+                timeout_config = aiohttp.ClientTimeout(total=self.timeout, connect=2)
                 
                 async with session.get(
                     self.test_url,
@@ -548,7 +523,10 @@ class FastProxyChecker:
                             data = await response.json()
                             ip_info = data.get('origin', 'Working')
                         except:
-                            ip_info = 'Working'
+                            try:
+                                ip_info = (await response.text()).strip() or 'Working'
+                            except:
+                                ip_info = 'Working'
                         
                         return proxy, True, response_time, ip_info
                         
@@ -569,7 +547,7 @@ class FastProxyChecker:
             enable_cleanup_closed=True
         )
         
-        timeout_config = aiohttp.ClientTimeout(total=self.timeout)
+        timeout_config = aiohttp.ClientTimeout(total=self.timeout * 2)
         
         async with aiohttp.ClientSession(
             connector=connector,
@@ -604,7 +582,7 @@ class FastProxyChecker:
                         
                         self.session['checked_count'] = self.checked_count
                         
-                        if self.checked_count % 20 == 0:
+                        if self.checked_count % 10 == 0:
                             try:
                                 await self.send_progress_update()
                             except Exception as e:
@@ -612,6 +590,8 @@ class FastProxyChecker:
                                 
                 except Exception as task_error:
                     logger.error(f"Task error: {task_error}")
+                    with self.lock:
+                        self.checked_count += 1
                     continue
 
     async def send_progress_update(self):
@@ -675,7 +655,7 @@ Status: Fast checking in progress..."""
                 continue
             
             if i < len(chunks) - 1:
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
 
 class CombinedProxyBot:
@@ -761,19 +741,19 @@ Hello {user.first_name}!
 Choose your checking mode:
 
 RESIDENTIAL CHECKER:
-- Premium residential proxy detection
-- Advanced IP analysis and scoring
-- Quality score: 35+ points
-- Settings: 8s timeout, 25 concurrent
-- Best for: Finding high-quality residential proxies
+• Premium residential proxy detection
+• Advanced IP analysis and scoring  
+• Quality score: 35+ points
+• Settings: 6s timeout, 12 concurrent
+• Best for: Finding high-quality residential proxies
 
 FAST CHECKER:
-- Ultra-fast HTTP connectivity testing
-- Basic working proxy detection
-- Settings: 5s timeout, 40 concurrent
-- Best for: Quick proxy validation
+• Ultra-fast HTTP connectivity testing
+• Basic working proxy detection
+• Settings: 4s timeout, 15 concurrent
+• Best for: Quick proxy validation
 
-Max limit: 20,000 proxies for both modes
+Max limit: 15,000 proxies for both modes
 Select your preferred mode below:"""
             
             keyboard = [
@@ -803,23 +783,20 @@ Select your preferred mode below:"""
             
             document = update.message.document
             
-            # Validate file
             if not document.file_name.endswith('.txt'):
                 await update.message.reply_text("Send a .txt file only!")
                 return
             
-            if document.file_size > 3 * 1024 * 1024:  # 3MB limit for Render stability
-                await update.message.reply_text("File too large! Max: 3MB")
+            if document.file_size > 2 * 1024 * 1024:  # 2MB limit for stability
+                await update.message.reply_text("File too large! Max: 2MB")
                 return
             
             processing_msg = await update.message.reply_text("Processing file...")
             
             try:
-                # Download file
                 file = await context.bot.get_file(document.file_id)
                 file_content = await file.download_as_bytearray()
                 
-                # Decode content
                 try:
                     content = file_content.decode('utf-8')
                 except UnicodeDecodeError:
@@ -830,7 +807,6 @@ Select your preferred mode below:"""
                 
                 lines = content.splitlines()
                 
-                # Clean proxies
                 raw_proxies = []
                 for line in lines:
                     clean_line = line.strip()
@@ -841,7 +817,7 @@ Select your preferred mode below:"""
                     await processing_msg.edit_text("No valid proxies found!")
                     return
                 
-                max_proxies = 20000  # Reduced limit for Render
+                max_proxies = 15000  # Reduced for Render stability
                 if len(raw_proxies) > max_proxies:
                     await processing_msg.edit_text(
                         f"Too many proxies! Found: {len(raw_proxies):,}, Max: {max_proxies:,}"
@@ -875,7 +851,6 @@ Select your preferred mode below:"""
             
             print(f"Starting {mode} check for user {user_id}: {len(proxies)} proxies")
             
-            # Create session based on mode
             if mode == 'residential':
                 session = {
                     'user_id': user_id,
@@ -890,8 +865,8 @@ Select your preferred mode below:"""
                     'status_message_id': None
                 }
                 mode_text = "Premium Residential Detection"
-                settings_text = "8s timeout, 25 concurrent"
-            else:  # fast mode
+                settings_text = "6s timeout, 12 concurrent"
+            else:
                 session = {
                     'user_id': user_id,
                     'proxies': proxies,
@@ -905,11 +880,10 @@ Select your preferred mode below:"""
                     'status_message_id': None
                 }
                 mode_text = "Fast HTTP Checking"
-                settings_text = "5s timeout, 40 concurrent"
+                settings_text = "4s timeout, 15 concurrent"
             
             self.active_sessions[user_id] = session
             
-            # Initial status
             keyboard = [[InlineKeyboardButton("Cancel", callback_data="cancel_session")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -926,7 +900,6 @@ This will analyze each proxy for quality!"""
             message = await update.message.reply_text(status_text, reply_markup=reply_markup)
             session['status_message_id'] = message.message_id
             
-            # Start checking
             asyncio.create_task(self.run_checking_process(context.bot, session))
             
         except Exception as e:
@@ -938,13 +911,11 @@ This will analyze each proxy for quality!"""
         try:
             print(f"Starting {session['mode']} process for user {session['user_id']}")
             
-            # Choose checker based on mode
             if session['mode'] == 'residential':
                 checker = EnhancedResidentialChecker(bot, session)
             else:
                 checker = FastProxyChecker(bot, session)
             
-            # Parse proxies
             parsed_proxies = []
             for line in session['proxies']:
                 try:
@@ -958,7 +929,6 @@ This will analyze each proxy for quality!"""
                 await self.send_error_message(bot, session, "No valid proxies found")
                 return
             
-            # Remove duplicates
             unique_proxies = list(dict.fromkeys(parsed_proxies))
             removed = len(parsed_proxies) - len(unique_proxies)
             if removed > 0:
@@ -966,10 +936,8 @@ This will analyze each proxy for quality!"""
             
             session['total_proxies'] = len(unique_proxies)
             
-            # Run tests
             await checker.run_tests(unique_proxies)
             
-            # Send results
             if not session.get('is_cancelled'):
                 await self.send_final_results(bot, session)
             
@@ -997,11 +965,9 @@ This will analyze each proxy for quality!"""
             if mode == 'residential':
                 results = session.get('premium_proxies', [])
                 result_type = "premium residential"
-                print(f"Results: {len(results)} premium residential proxies found")
             else:
                 results = session.get('working_proxies', [])
                 result_type = "working"
-                print(f"Results: {len(results)} working proxies found")
             
             success_rate = (len(results) / session['total_proxies']) * 100 if session['total_proxies'] > 0 else 0
             avg_rate = session['total_proxies'] / total_time if total_time > 0 else 0
@@ -1058,7 +1024,6 @@ Results:
                 
             timestamp = int(time.time())
             
-            # Clean file
             clean_content = ""
             for proxy_data in results:
                 clean_content += f"{proxy_data['proxy']}\n"
@@ -1072,7 +1037,6 @@ Results:
                 caption=f"{file_description} ({len(results)} found)"
             )
             
-            # Detailed file
             detailed_content = f"# {file_description} Results\n"
             detailed_content += f"# Checked: {session['total_proxies']}\n"
             detailed_content += f"# Found: {len(results)}\n"
@@ -1161,8 +1125,8 @@ Supported formats:
 Requirements:
 • .txt file format only
 • One proxy per line
-• Max 20,000 proxies
-• Max file size: 3MB
+• Max 15,000 proxies
+• Max file size: 2MB
 
 This mode will analyze each proxy for:
 - ISP type and residential indicators
@@ -1192,8 +1156,8 @@ Supported formats:
 Requirements:
 • .txt file format only
 • One proxy per line
-• Max 20,000 proxies
-• Max file size: 3MB
+• Max 15,000 proxies
+• Max file size: 2MB
 
 This mode will test for:
 - Basic HTTP connectivity
@@ -1232,8 +1196,8 @@ SUPPORTED FORMATS:
 • socks5://ip:port
 
 LIMITS & SPECS:
-• Max proxies: 20,000
-• Max file size: 3MB
+• Max proxies: 15,000
+• Max file size: 2MB
 • File format: .txt only
 
 COMMANDS:
@@ -1255,19 +1219,19 @@ Choose mode based on your needs!"""
 Choose your checking mode:
 
 RESIDENTIAL CHECKER:
-- Premium residential proxy detection
-- Advanced IP analysis and scoring
-- Quality score: 35+ points
-- Settings: 8s timeout, 25 concurrent
-- Best for: Finding high-quality residential proxies
+• Premium residential proxy detection
+• Advanced IP analysis and scoring
+• Quality score: 35+ points
+• Settings: 6s timeout, 12 concurrent
+• Best for: Finding high-quality residential proxies
 
 FAST CHECKER:
-- Ultra-fast HTTP connectivity testing
-- Basic working proxy detection
-- Settings: 5s timeout, 40 concurrent
-- Best for: Quick proxy validation
+• Ultra-fast HTTP connectivity testing
+• Basic working proxy detection
+• Settings: 4s timeout, 15 concurrent
+• Best for: Quick proxy validation
 
-Max limit: 20,000 proxies for both modes
+Max limit: 15,000 proxies for both modes
 Select your preferred mode below:"""
                 
                 keyboard = [
@@ -1306,7 +1270,6 @@ async def setup_bot():
     try:
         print("Creating bot application...")
         
-        # Create application with proper settings for webhook
         bot_application = (
             Application.builder()
             .token(BOT_TOKEN)
@@ -1320,14 +1283,12 @@ async def setup_bot():
         proxy_bot = CombinedProxyBot()
         print("Bot instance created")
         
-        # Add handlers
         bot_application.add_handler(CommandHandler("start", proxy_bot.start))
         bot_application.add_handler(CommandHandler("cancel", proxy_bot.cancel_command))
         bot_application.add_handler(CommandHandler("stats", proxy_bot.admin_stats))
         bot_application.add_handler(MessageHandler(filters.Document.ALL, proxy_bot.handle_document))
         bot_application.add_handler(CallbackQueryHandler(proxy_bot.button_handler))
         
-        # Error handler
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error: {context.error}")
             if update and update.effective_user:
@@ -1342,11 +1303,9 @@ async def setup_bot():
         bot_application.add_error_handler(error_handler)
         print("Handlers registered")
         
-        # Initialize
         await bot_application.initialize()
         await bot_application.start()
         
-        # Set webhook
         webhook_url = f"{WEBHOOK_URL}/webhook"
         await bot_application.bot.set_webhook(webhook_url)
         print(f"Webhook set: {webhook_url}")
@@ -1380,18 +1339,14 @@ async def main():
     print(f"Webhook URL: {WEBHOOK_URL}")
     print("=" * 60)
     
-    # Validate environment
-    print("Validating environment...")
     if not WEBHOOK_URL.startswith(('http://', 'https://')):
         print(f"ERROR: WEBHOOK_URL must start with http:// or https://")
         return
     
-    # Test bot connection
     if not test_bot_connection():
         print("Bot connection failed!")
         return
     
-    # Setup bot
     if not await setup_bot():
         print("Bot setup failed!")
         return
@@ -1401,7 +1356,6 @@ async def main():
     print(f"Webhook endpoint: {WEBHOOK_URL}/webhook")
     print("Go to Telegram and send /start to your bot!")
     
-    # Run Flask server (this will block)
     run_webhook_server()
 
 
