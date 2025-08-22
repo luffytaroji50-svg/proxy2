@@ -1,4 +1,4 @@
-# Combined Proxy Checker Bot - Render Deployment
+# Combined Proxy Checker Bot - Render Webhook Deployment
 import aiohttp
 import asyncio
 import time
@@ -15,6 +15,7 @@ import logging
 import traceback
 import requests
 from flask import Flask, request, jsonify
+import concurrent.futures
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,23 +23,33 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram.constants import ParseMode
 
 # Bot configuration - Use environment variables for security
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8369356968:AAHzQJMnOWvor5w8FSOt6Ili5NvexWWg5Wo")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6307224822").split(",")]
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 10000))
+
+# Validate required environment variables
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+if not WEBHOOK_URL:
+    raise ValueError("WEBHOOK_URL environment variable is required")
+if not ADMIN_IDS:
+    raise ValueError("ADMIN_IDS environment variable is required")
 
 # Configure logging for Render
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler()  # Log to stdout for Render
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 # Flask app for health checks and webhooks
 app = Flask(__name__)
+
+# Global variables
+bot_application = None
+proxy_bot = None
 
 @app.route("/")
 def health_check():
@@ -46,17 +57,47 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "service": "proxy-checker-bot"
+        "service": "proxy-checker-bot",
+        "bot_ready": bot_application is not None
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Webhook endpoint for Telegram"""
     try:
-        json_data = request.get_json()
+        if not bot_application:
+            logger.error("Bot application not ready")
+            return "Bot not ready", 503
+            
+        json_data = request.get_json(force=True)
+        if not json_data:
+            return "No data", 400
+            
         update = Update.de_json(json_data, bot_application.bot)
-        asyncio.create_task(bot_application.process_update(update))
+        if not update:
+            return "Invalid update", 400
+            
+        # Process update in background
+        def process_update():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(bot_application.process_update(update))
+            except Exception as e:
+                logger.error(f"Update processing error: {e}")
+            finally:
+                try:
+                    loop.close()
+                except:
+                    pass
+        
+        # Use thread pool to handle updates
+        thread = threading.Thread(target=process_update)
+        thread.daemon = True
+        thread.start()
+        
         return "OK"
+        
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return "Error", 400
@@ -99,11 +140,11 @@ class EnhancedResidentialChecker:
         self.lock = threading.Lock()
         self.start_time = time.time()
         
-        # Settings optimized for stability
+        # Settings optimized for Render
         self.timeout = 8
-        self.max_concurrent = 30  # Reduced for stability on Render
+        self.max_concurrent = 25  # Reduced for stability
         self.test_url = "http://httpbin.org/ip"
-        self.chunk_size = 50  # Smaller chunks for better memory management
+        self.chunk_size = 40
         
         # Real browser user agents
         self.user_agents = [
@@ -121,7 +162,7 @@ class EnhancedResidentialChecker:
         
         # Remove (Http) prefix if present
         if proxy_line.startswith('(Http)'):
-            proxy_line = proxy_line[6:]
+            proxy_line = proxy_line[6:].strip()
         
         try:
             # Format: http://host:port
@@ -177,7 +218,7 @@ class EnhancedResidentialChecker:
         }
 
     async def analyze_proxy_quality(self, session, proxy, ip_address):
-        """Simplified IP analysis with reliable scoring"""
+        """Analyze proxy quality with reliable scoring"""
         quality_score = 0
         analysis_data = {}
         
@@ -189,13 +230,13 @@ class EnhancedResidentialChecker:
         try:
             # Use IP-API for comprehensive analysis
             url = f'http://ip-api.com/json/{ip_address}?fields=status,country,regionName,city,isp,org,as,proxy,hosting,mobile'
-            async with session.get(url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get('status') == 'success':
                         analysis_data = data
                         
-                        # Simplified scoring system
+                        # Scoring system
                         if not data.get('hosting', True):
                             quality_score += 30
                         
@@ -205,7 +246,7 @@ class EnhancedResidentialChecker:
                         if data.get('mobile', False):
                             quality_score += 25
                         
-                        # Check ISP for residential indicators
+                        # ISP analysis
                         isp = data.get('isp', '').lower()
                         residential_keywords = [
                             'comcast', 'verizon', 'att', 'charter', 'cox', 'spectrum', 'xfinity',
@@ -223,7 +264,7 @@ class EnhancedResidentialChecker:
                         elif any(keyword in isp for keyword in datacenter_keywords):
                             quality_score -= 25
             
-            await asyncio.sleep(1)  # Increased rate limiting for stability
+            await asyncio.sleep(1.2)  # Rate limiting
             
         except Exception as e:
             logger.debug(f"IP analysis failed for {ip_address}: {e}")
@@ -231,7 +272,7 @@ class EnhancedResidentialChecker:
         return quality_score, analysis_data
 
     async def test_proxy_comprehensive(self, session, proxy, semaphore):
-        """Comprehensive proxy testing with quality analysis"""
+        """Test proxy with quality analysis"""
         async with semaphore:
             try:
                 start_time = time.time()
@@ -262,16 +303,16 @@ class EnhancedResidentialChecker:
                     if not ip_address:
                         return proxy, False, 0, None, "No IP extracted"
                     
-                    # Analyze proxy quality
+                    # Analyze quality
                     quality_score, analysis_data = await self.analyze_proxy_quality(session, proxy, ip_address)
                     
                     # Speed bonus
-                    if response_time > 2000:
+                    if response_time < 1000:
                         quality_score += 10
-                    elif response_time > 1000:
+                    elif response_time < 2000:
                         quality_score += 5
                     
-                    # Determine if premium residential
+                    # Premium threshold
                     is_premium = quality_score >= 35
                     
                     result_data = {
@@ -342,7 +383,7 @@ class EnhancedResidentialChecker:
                         
                         self.session['checked_count'] = self.checked_count
                         
-                        if self.checked_count % 10 == 0:  # More frequent updates
+                        if self.checked_count % 10 == 0:
                             try:
                                 await self.send_progress_update()
                             except Exception as e:
@@ -353,7 +394,7 @@ class EnhancedResidentialChecker:
                     continue
 
     async def send_progress_update(self):
-        """Send progress update to Telegram"""
+        """Send progress update"""
         if self.session.get('is_cancelled'):
             return
         
@@ -413,7 +454,7 @@ Status: Analyzing proxy quality..."""
                 continue
             
             if i < len(chunks) - 1:
-                await asyncio.sleep(3)  # Longer delays for stability
+                await asyncio.sleep(3)
 
 
 class FastProxyChecker:
@@ -426,11 +467,11 @@ class FastProxyChecker:
         self.lock = threading.Lock()
         self.start_time = time.time()
         
-        # Settings optimized for speed but stable on Render
+        # Settings optimized for speed but stable
         self.timeout = 5
-        self.max_concurrent = 50  # Reduced for stability
+        self.max_concurrent = 40
         self.test_url = "http://httpbin.org/ip"
-        self.chunk_size = 200  # Smaller chunks
+        self.chunk_size = 150
         
     def parse_proxy(self, proxy_line):
         """Parse all different proxy formats"""
@@ -440,7 +481,7 @@ class FastProxyChecker:
         
         # Remove (Http) prefix if present
         if proxy_line.startswith('(Http)'):
-            proxy_line = proxy_line[6:]
+            proxy_line = proxy_line[6:].strip()
         
         try:
             # Format: http://host:port
@@ -574,7 +615,7 @@ class FastProxyChecker:
                     continue
 
     async def send_progress_update(self):
-        """Send progress update to Telegram"""
+        """Send progress update"""
         if self.session.get('is_cancelled'):
             return
         
@@ -641,7 +682,7 @@ class CombinedProxyBot:
     def __init__(self):
         self.active_sessions = {}
         self.session_lock = threading.Lock()
-        self.user_stats = {}  # Track user usage
+        self.user_stats = {}
         
     def is_admin(self, user_id):
         """Check if user is admin"""
@@ -656,20 +697,18 @@ class CombinedProxyBot:
             return
             
         try:
-            # Gather statistics
             total_users = len(self.user_stats)
             active_sessions = len(self.active_sessions)
             
-            # Most active users
             sorted_users = sorted(self.user_stats.items(), key=lambda x: x[1].get('total_checks', 0), reverse=True)
             
-            stats_text = f"""📊 BOT STATISTICS
+            stats_text = f"""Bot Statistics
 
-👥 Total Users: {total_users}
-🔄 Active Sessions: {active_sessions}
-💾 Memory Usage: {len(self.active_sessions)} sessions stored
+Total Users: {total_users}
+Active Sessions: {active_sessions}
+Memory Usage: {len(self.active_sessions)} sessions stored
 
-🏆 TOP USERS:"""
+Top Users:"""
             
             for i, (uid, data) in enumerate(sorted_users[:5], 1):
                 username = data.get('username', 'Unknown')
@@ -677,7 +716,7 @@ class CombinedProxyBot:
                 stats_text += f"\n{i}. @{username} - {total_checks} checks"
             
             if active_sessions > 0:
-                stats_text += f"\n\n🔄 ACTIVE SESSIONS:"
+                stats_text += f"\n\nActive Sessions:"
                 for session_user_id, session in self.active_sessions.items():
                     mode = session.get('mode', 'unknown')
                     progress = session.get('checked_count', 0)
@@ -688,140 +727,6 @@ class CombinedProxyBot:
             
         except Exception as e:
             await update.message.reply_text(f"Error generating stats: {str(e)}")
-    
-    async def admin_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin command to broadcast message to all users"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("Access denied. Admin only command.")
-            return
-        
-        if not context.args:
-            await update.message.reply_text("Usage: /broadcast <message>")
-            return
-        
-        message = " ".join(context.args)
-        sent_count = 0
-        failed_count = 0
-        
-        status_msg = await update.message.reply_text("Broadcasting message...")
-        
-        for uid in self.user_stats.keys():
-            try:
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"📢 ADMIN MESSAGE:\n\n{message}"
-                )
-                sent_count += 1
-                await asyncio.sleep(0.1)  # Rate limiting
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"Failed to send to {uid}: {e}")
-        
-        await status_msg.edit_text(
-            f"Broadcast complete!\nSent: {sent_count}\nFailed: {failed_count}"
-        )
-    
-    async def admin_cancel_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin command to cancel all active sessions"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("Access denied. Admin only command.")
-            return
-        
-        cancelled_count = 0
-        for session in self.active_sessions.values():
-            session['is_cancelled'] = True
-            cancelled_count += 1
-        
-        await update.message.reply_text(f"Cancelled {cancelled_count} active sessions.")
-        
-        # Clear sessions after delay
-        await asyncio.sleep(3)
-        self.active_sessions.clear()
-    
-    async def admin_user_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin command to get user information"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("Access denied. Admin only command.")
-            return
-        
-        if not context.args:
-            await update.message.reply_text("Usage: /userinfo <user_id>")
-            return
-        
-        try:
-            target_user_id = int(context.args[0])
-            
-            if target_user_id in self.user_stats:
-                user_data = self.user_stats[target_user_id]
-                info_text = f"""👤 USER INFO
-
-User ID: {target_user_id}
-Username: @{user_data.get('username', 'Unknown')}
-First Name: {user_data.get('first_name', 'Unknown')}
-Total Checks: {user_data.get('total_checks', 0)}
-Last Seen: {user_data.get('last_seen', 'Never')}
-Preferred Mode: {user_data.get('preferred_mode', 'None')}
-
-Active Session: {'Yes' if target_user_id in self.active_sessions else 'No'}"""
-                
-                if target_user_id in self.active_sessions:
-                    session = self.active_sessions[target_user_id]
-                    info_text += f"\nCurrent Mode: {session.get('mode', 'Unknown')}"
-                    info_text += f"\nProgress: {session.get('checked_count', 0)}/{session.get('total_proxies', 0)}"
-                
-                await update.message.reply_text(info_text)
-            else:
-                await update.message.reply_text("User not found in database.")
-                
-        except ValueError:
-            await update.message.reply_text("Invalid user ID format.")
-        except Exception as e:
-            await update.message.reply_text(f"Error: {str(e)}")
-    
-    async def admin_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin help command"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("Access denied. Admin only command.")
-            return
-        
-        help_text = """🔧 ADMIN COMMANDS
-
-/stats - View bot statistics
-/broadcast <message> - Send message to all users
-/cancelall - Cancel all active sessions
-/userinfo <user_id> - Get user information
-/admins - List all admin commands
-
-📊 STATISTICS:
-- Total users registered
-- Active sessions count
-- Top users by usage
-- Current session details
-
-📢 BROADCAST:
-- Send announcements to all users
-- Rate limited for safety
-- Shows delivery statistics
-
-🛑 SESSION MANAGEMENT:
-- Cancel all running sessions
-- Force stop any user's checking
-- Clear memory usage
-
-👤 USER MANAGEMENT:
-- View detailed user information
-- Check user activity and preferences
-- Monitor active sessions"""
-        
-        await update.message.reply_text(help_text)
     
     def update_user_stats(self, user_id, username, first_name, mode=None):
         """Update user statistics"""
@@ -840,42 +745,41 @@ Active Session: {'Yes' if target_user_id in self.active_sessions else 'No'}"""
             self.user_stats[user_id]['total_checks'] += 1
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start command handler with mode selection"""
+        """Start command handler"""
         try:
             user = update.effective_user
             user_id = user.id
             
-            # Update user stats
             self.update_user_stats(user_id, user.username or 'None', user.first_name or 'Unknown')
             
             print(f"User {user_id} ({user.first_name}) started the bot")
             
-            welcome_text = f"""🔥 Combined Proxy Checker Bot 🔥
+            welcome_text = f"""Combined Proxy Checker Bot
 
 Hello {user.first_name}!
 
 Choose your checking mode:
 
-🏠 RESIDENTIAL CHECKER:
+RESIDENTIAL CHECKER:
 - Premium residential proxy detection
 - Advanced IP analysis and scoring
 - Quality score: 35+ points
-- Settings: 8s timeout, 30 concurrent
+- Settings: 8s timeout, 25 concurrent
 - Best for: Finding high-quality residential proxies
 
-⚡ FAST CHECKER:
+FAST CHECKER:
 - Ultra-fast HTTP connectivity testing
 - Basic working proxy detection
-- Settings: 5s timeout, 50 concurrent
+- Settings: 5s timeout, 40 concurrent
 - Best for: Quick proxy validation
 
-📊 Max limit: 25,000 proxies for both modes
+Max limit: 20,000 proxies for both modes
 Select your preferred mode below:"""
             
             keyboard = [
-                [InlineKeyboardButton("🏠 Residential Checker", callback_data="mode_residential")],
-                [InlineKeyboardButton("⚡ Fast Checker", callback_data="mode_fast")],
-                [InlineKeyboardButton("❓ Help", callback_data="show_help")]
+                [InlineKeyboardButton("Residential Checker", callback_data="mode_residential")],
+                [InlineKeyboardButton("Fast Checker", callback_data="mode_fast")],
+                [InlineKeyboardButton("Help", callback_data="show_help")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -901,14 +805,14 @@ Select your preferred mode below:"""
             
             # Validate file
             if not document.file_name.endswith('.txt'):
-                await update.message.reply_text("📄 Send a .txt file only!")
+                await update.message.reply_text("Send a .txt file only!")
                 return
             
-            if document.file_size > 5 * 1024 * 1024:  # 5MB limit for Render
-                await update.message.reply_text("📦 File too large! Max: 5MB")
+            if document.file_size > 3 * 1024 * 1024:  # 3MB limit for Render stability
+                await update.message.reply_text("File too large! Max: 3MB")
                 return
             
-            processing_msg = await update.message.reply_text("🔄 Processing file...")
+            processing_msg = await update.message.reply_text("Processing file...")
             
             try:
                 # Download file
@@ -934,13 +838,13 @@ Select your preferred mode below:"""
                         raw_proxies.append(clean_line)
                 
                 if not raw_proxies:
-                    await processing_msg.edit_text("❌ No valid proxies found!")
+                    await processing_msg.edit_text("No valid proxies found!")
                     return
                 
-                max_proxies = 25000  # Reduced limit for Render
+                max_proxies = 20000  # Reduced limit for Render
                 if len(raw_proxies) > max_proxies:
                     await processing_msg.edit_text(
-                        f"⚠️ Too many proxies! Found: {len(raw_proxies):,}, Max: {max_proxies:,}"
+                        f"Too many proxies! Found: {len(raw_proxies):,}, Max: {max_proxies:,}"
                     )
                     return
                 
@@ -950,11 +854,11 @@ Select your preferred mode below:"""
                 
             except Exception as file_error:
                 logger.error(f"File error: {file_error}")
-                await processing_msg.edit_text(f"❌ File processing error: {str(file_error)[:50]}")
+                await processing_msg.edit_text(f"File processing error: {str(file_error)[:50]}")
                 
         except Exception as e:
             logger.error(f"Document handler error: {e}")
-            await update.message.reply_text("❌ File processing failed. Try again.")
+            await update.message.reply_text("File processing failed. Try again.")
 
     async def start_checking(self, update: Update, context: ContextTypes.DEFAULT_TYPE, proxies, filename):
         """Start the checking process"""
@@ -962,12 +866,11 @@ Select your preferred mode below:"""
             user_id = update.effective_user.id
             mode = context.user_data.get('mode')
             
-            # Update user stats with mode preference
             self.update_user_stats(user_id, update.effective_user.username or 'None', 
                                  update.effective_user.first_name or 'Unknown', mode)
             
             if user_id in self.active_sessions:
-                await update.message.reply_text("⚠️ Session already exists!")
+                await update.message.reply_text("Session already exists!")
                 return
             
             print(f"Starting {mode} check for user {user_id}: {len(proxies)} proxies")
@@ -986,8 +889,8 @@ Select your preferred mode below:"""
                     'is_cancelled': False,
                     'status_message_id': None
                 }
-                mode_text = "🏠 Premium Residential Detection"
-                settings_text = "8s timeout, 30 concurrent"
+                mode_text = "Premium Residential Detection"
+                settings_text = "8s timeout, 25 concurrent"
             else:  # fast mode
                 session = {
                     'user_id': user_id,
@@ -1001,24 +904,24 @@ Select your preferred mode below:"""
                     'is_cancelled': False,
                     'status_message_id': None
                 }
-                mode_text = "⚡ Fast HTTP Checking"
-                settings_text = "5s timeout, 50 concurrent"
+                mode_text = "Fast HTTP Checking"
+                settings_text = "5s timeout, 40 concurrent"
             
             self.active_sessions[user_id] = session
             
             # Initial status
-            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_session")]]
+            keyboard = [[InlineKeyboardButton("Cancel", callback_data="cancel_session")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            status_text = f"""🚀 Proxy Checking Started
+            status_text = f"""Proxy Checking Started
 
-📁 File: {filename}
-📊 Proxies: {len(proxies):,}
-🔧 Mode: {mode_text}
-⚙️ Settings: {settings_text}
-📡 Status: Starting...
+File: {filename}
+Proxies: {len(proxies):,}
+Mode: {mode_text}
+Settings: {settings_text}
+Status: Starting...
 
-🔍 This will analyze each proxy for quality!"""
+This will analyze each proxy for quality!"""
             
             message = await update.message.reply_text(status_text, reply_markup=reply_markup)
             session['status_message_id'] = message.message_id
@@ -1028,7 +931,7 @@ Select your preferred mode below:"""
             
         except Exception as e:
             logger.error(f"Start checking error: {e}")
-            await update.message.reply_text("❌ Error starting. Try again.")
+            await update.message.reply_text("Error starting. Try again.")
 
     async def run_checking_process(self, bot, session):
         """Main checking process"""
@@ -1094,28 +997,26 @@ Select your preferred mode below:"""
             if mode == 'residential':
                 results = session.get('premium_proxies', [])
                 result_type = "premium residential"
-                emoji = "🏠"
                 print(f"Results: {len(results)} premium residential proxies found")
             else:
                 results = session.get('working_proxies', [])
                 result_type = "working"
-                emoji = "⚡"
                 print(f"Results: {len(results)} working proxies found")
             
             success_rate = (len(results) / session['total_proxies']) * 100 if session['total_proxies'] > 0 else 0
             avg_rate = session['total_proxies'] / total_time if total_time > 0 else 0
             
-            summary = f"""✅ Proxy Checking Complete!
+            summary = f"""Proxy Checking Complete!
 
-{emoji} Mode: {mode.title()} Checker
-📊 Results:
+Mode: {mode.title()} Checker
+Results:
 • Checked: {session['total_proxies']:,}
 • {result_type.title()} found: {len(results)}
 • Success: {success_rate:.1f}%
 • Time: {total_time:.1f}s
 • Rate: {avg_rate:.1f}/s
 
-{f"🏆 Top {result_type} proxies:" if results else f"❌ No {result_type} proxies found"}"""
+{f"Top {result_type} proxies:" if results else f"No {result_type} proxies found"}"""
             
             if results:
                 if mode == 'residential':
@@ -1123,12 +1024,12 @@ Select your preferred mode below:"""
                     for i, proxy_data in enumerate(sorted_results[:5], 1):
                         details = proxy_data['details']
                         summary += f"\n{i}. {proxy_data['proxy']}"
-                        summary += f"\n   ⏱️ {proxy_data['response_time']}ms | 📊 Score: {details['quality_score']} | 🌍 {details['country']}"
+                        summary += f"\n   {proxy_data['response_time']}ms | Score: {details['quality_score']} | {details['country']}"
                 else:
                     sorted_results = sorted(results, key=lambda x: x.get('response_time', 9999))
                     for i, proxy_data in enumerate(sorted_results[:5], 1):
                         summary += f"\n{i}. {proxy_data['proxy']}"
-                        summary += f"\n   ⏱️ {proxy_data['response_time']}ms"
+                        summary += f"\n   {proxy_data['response_time']}ms"
             
             await bot.send_message(user_id, summary)
             
@@ -1146,11 +1047,11 @@ Select your preferred mode below:"""
             if mode == 'residential':
                 results = session.get('premium_proxies', [])
                 file_prefix = "premium_residential"
-                file_description = "🏠 Premium Residential Proxies"
+                file_description = "Premium Residential Proxies"
             else:
                 results = session.get('working_proxies', [])
                 file_prefix = "working_proxies"
-                file_description = "⚡ Working Proxies"
+                file_description = "Working Proxies"
             
             if not results:
                 return
@@ -1193,7 +1094,7 @@ Select your preferred mode below:"""
             await bot.send_document(
                 user_id,
                 detailed_file,
-                caption="📋 Detailed Results with analysis"
+                caption="Detailed Results with analysis"
             )
             
             print(f"Files sent to user {user_id}")
@@ -1208,7 +1109,7 @@ Select your preferred mode below:"""
             if user_id:
                 await bot.send_message(
                     user_id,
-                    f"❌ Error: {str(error)[:150]}\n\n🔄 Try again with /start"
+                    f"Error: {str(error)[:150]}\n\nTry again with /start"
                 )
         except Exception as e:
             logger.error(f"Error message failed: {e}")
@@ -1219,11 +1120,11 @@ Select your preferred mode below:"""
             user_id = update.effective_user.id
             
             if user_id not in self.active_sessions:
-                await update.message.reply_text("❌ No active session.")
+                await update.message.reply_text("No active session.")
                 return
             
             self.active_sessions[user_id]['is_cancelled'] = True
-            await update.message.reply_text("✅ Session cancelled.\n\n🔄 Use /start to begin again.")
+            await update.message.reply_text("Session cancelled.\n\nUse /start to begin again.")
             
             await asyncio.sleep(2)
             if user_id in self.active_sessions:
@@ -1231,7 +1132,7 @@ Select your preferred mode below:"""
                 
         except Exception as e:
             logger.error(f"Cancel error: {e}")
-            await update.message.reply_text("❌ Cancel failed.")
+            await update.message.reply_text("Cancel failed.")
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button clicks"""
@@ -1246,30 +1147,30 @@ Select your preferred mode below:"""
                 context.user_data['mode'] = 'residential'
                 context.user_data['waiting_for_file'] = True
                 
-                instructions = """📤 Send your proxy list file
+                instructions = """Send your proxy list file
 
-🏠 RESIDENTIAL CHECKER MODE SELECTED
+RESIDENTIAL CHECKER MODE SELECTED
 
-📝 Supported formats:
+Supported formats:
 • ip:port
 • ip:port:username:password  
 • username:password@ip:port
 • http://ip:port
 • socks5://ip:port
 
-📋 Requirements:
+Requirements:
 • .txt file format only
 • One proxy per line
-• Max 25,000 proxies
-• Max file size: 5MB
+• Max 20,000 proxies
+• Max file size: 3MB
 
-🔍 This mode will analyze each proxy for:
+This mode will analyze each proxy for:
 - ISP type and residential indicators
 - Hosting/datacenter detection
 - Mobile connection detection
 - Quality scoring (35+ = premium)
 
-📁 Upload your file now..."""
+Upload your file now..."""
                 
                 await query.edit_message_text(instructions)
                 
@@ -1277,37 +1178,37 @@ Select your preferred mode below:"""
                 context.user_data['mode'] = 'fast'
                 context.user_data['waiting_for_file'] = True
                 
-                instructions = """📤 Send your proxy list file
+                instructions = """Send your proxy list file
 
-⚡ FAST CHECKER MODE SELECTED
+FAST CHECKER MODE SELECTED
 
-📝 Supported formats:
+Supported formats:
 • ip:port
 • ip:port:username:password  
 • username:password@ip:port
 • http://ip:port
 • socks5://ip:port
 
-📋 Requirements:
+Requirements:
 • .txt file format only
 • One proxy per line
-• Max 25,000 proxies
-• Max file size: 5MB
+• Max 20,000 proxies
+• Max file size: 3MB
 
-🔍 This mode will test for:
+This mode will test for:
 - Basic HTTP connectivity
 - Response time measurement
 - IP extraction
 - Quick validation only
 
-📁 Upload your file now..."""
+Upload your file now..."""
                 
                 await query.edit_message_text(instructions)
                 
             elif data == "show_help":
-                help_text = """❓ HELP - Combined Proxy Checker Bot
+                help_text = """HELP - Combined Proxy Checker Bot
 
-🏠 RESIDENTIAL CHECKER:
+RESIDENTIAL CHECKER:
 • Deep analysis of proxy quality
 • ISP detection and scoring
 • Mobile/hosting identification
@@ -1315,7 +1216,7 @@ Select your preferred mode below:"""
 • Slower but more detailed
 • Best for: Quality over quantity
 
-⚡ FAST CHECKER:
+FAST CHECKER:
 • Quick HTTP connectivity test
 • Basic working validation
 • Response time measurement
@@ -1323,55 +1224,56 @@ Select your preferred mode below:"""
 • Faster processing
 • Best for: Quantity over quality
 
-📝 SUPPORTED FORMATS:
+SUPPORTED FORMATS:
 • ip:port
 • ip:port:user:pass
 • user:pass@ip:port
 • http://ip:port
 • socks5://ip:port
 
-📊 LIMITS & SPECS:
-• Max proxies: 25,000
-• Max file size: 5MB
+LIMITS & SPECS:
+• Max proxies: 20,000
+• Max file size: 3MB
 • File format: .txt only
 
-🤖 COMMANDS:
+COMMANDS:
 /start - Main menu
 /cancel - Stop active session
 
-💡 Choose mode based on your needs!"""
+Choose mode based on your needs!"""
                 
                 keyboard = [
-                    [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+                    [InlineKeyboardButton("Back to Menu", callback_data="back_to_menu")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 await query.edit_message_text(help_text, reply_markup=reply_markup)
                 
             elif data == "back_to_menu":
-                welcome_text = """🔥 Combined Proxy Checker Bot 🔥
+                welcome_text = """Combined Proxy Checker Bot
 
 Choose your checking mode:
 
-🏠 RESIDENTIAL CHECKER:
+RESIDENTIAL CHECKER:
 - Premium residential proxy detection
 - Advanced IP analysis and scoring
 - Quality score: 35+ points
-- Settings: 8s timeout, 30 concurrent
+- Settings: 8s timeout, 25 concurrent
 - Best for: Finding high-quality residential proxies
 
-⚡ FAST CHECKER:
+FAST CHECKER:
 - Ultra-fast HTTP connectivity testing
 - Basic working proxy detection
-- Settings: 5s timeout, 50 concurrent
+- Settings: 5s timeout, 40 concurrent
 - Best for: Quick proxy validation
 
-📊 Select your preferred mode below:"""
+Max limit: 20,000 proxies for both modes
+Select your preferred mode below:"""
                 
                 keyboard = [
-                    [InlineKeyboardButton("🏠 Residential Checker", callback_data="mode_residential")],
-                    [InlineKeyboardButton("⚡ Fast Checker", callback_data="mode_fast")],
-                    [InlineKeyboardButton("❓ Help", callback_data="show_help")]
+                    [InlineKeyboardButton("Residential Checker", callback_data="mode_residential")],
+                    [InlineKeyboardButton("Fast Checker", callback_data="mode_fast")],
+                    [InlineKeyboardButton("Help", callback_data="show_help")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
@@ -1379,11 +1281,11 @@ Choose your checking mode:
                 
             elif data == "cancel_session":
                 if user_id not in self.active_sessions:
-                    await query.edit_message_text("❌ No session found.")
+                    await query.edit_message_text("No session found.")
                     return
                 
                 self.active_sessions[user_id]['is_cancelled'] = True
-                await query.edit_message_text("✅ Session cancelled.\n\n🔄 Use /start to restart.")
+                await query.edit_message_text("Session cancelled.\n\nUse /start to restart.")
                 
                 await asyncio.sleep(2)
                 if user_id in self.active_sessions:
@@ -1392,23 +1294,19 @@ Choose your checking mode:
         except Exception as e:
             logger.error(f"Button error: {e}")
             try:
-                await query.edit_message_text("❌ Error occurred.")
+                await query.edit_message_text("Error occurred.")
             except:
                 pass
 
 
-# Global bot application
-bot_application = None
-
-
 async def setup_bot():
     """Setup the bot application"""
-    global bot_application
+    global bot_application, proxy_bot
     
     try:
-        print("🤖 Creating bot application...")
+        print("Creating bot application...")
         
-        # Create application with webhook settings
+        # Create application with proper settings for webhook
         bot_application = (
             Application.builder()
             .token(BOT_TOKEN)
@@ -1419,22 +1317,15 @@ async def setup_bot():
             .build()
         )
         
-        bot_instance = CombinedProxyBot()
-        print("✅ Bot instance created")
+        proxy_bot = CombinedProxyBot()
+        print("Bot instance created")
         
         # Add handlers
-        bot_application.add_handler(CommandHandler("start", bot_instance.start))
-        bot_application.add_handler(CommandHandler("cancel", bot_instance.cancel_command))
-        
-        # Admin commands
-        bot_application.add_handler(CommandHandler("stats", bot_instance.admin_stats))
-        bot_application.add_handler(CommandHandler("broadcast", bot_instance.admin_broadcast))
-        bot_application.add_handler(CommandHandler("cancelall", bot_instance.admin_cancel_all))
-        bot_application.add_handler(CommandHandler("userinfo", bot_instance.admin_user_info))
-        bot_application.add_handler(CommandHandler("admins", bot_instance.admin_help))
-        
-        bot_application.add_handler(MessageHandler(filters.Document.ALL, bot_instance.handle_document))
-        bot_application.add_handler(CallbackQueryHandler(bot_instance.button_handler))
+        bot_application.add_handler(CommandHandler("start", proxy_bot.start))
+        bot_application.add_handler(CommandHandler("cancel", proxy_bot.cancel_command))
+        bot_application.add_handler(CommandHandler("stats", proxy_bot.admin_stats))
+        bot_application.add_handler(MessageHandler(filters.Document.ALL, proxy_bot.handle_document))
+        bot_application.add_handler(CallbackQueryHandler(proxy_bot.button_handler))
         
         # Error handler
         async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1443,108 +1334,82 @@ async def setup_bot():
                 try:
                     await context.bot.send_message(
                         update.effective_user.id,
-                        "❌ An error occurred. Please try /start"
+                        "An error occurred. Please try /start"
                     )
                 except:
                     pass
         
         bot_application.add_error_handler(error_handler)
-        print("✅ Handlers registered")
+        print("Handlers registered")
         
         # Initialize
         await bot_application.initialize()
         await bot_application.start()
         
-        # Set webhook if URL provided
-        if WEBHOOK_URL:
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            await bot_application.bot.set_webhook(webhook_url)
-            print(f"✅ Webhook set: {webhook_url}")
+        # Set webhook
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        await bot_application.bot.set_webhook(webhook_url)
+        print(f"Webhook set: {webhook_url}")
         
-        print("✅ Bot setup complete!")
+        print("Bot setup complete!")
         return True
         
     except Exception as e:
-        print(f"❌ Bot setup failed: {e}")
+        print(f"Bot setup failed: {e}")
+        traceback.print_exc()
         return False
 
 
-def run_flask_app():
-    """Run Flask app in a separate thread"""
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+def run_webhook_server():
+    """Run the webhook server"""
+    try:
+        print(f"Starting webhook server on port {PORT}")
+        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"Flask server error: {e}")
 
 
 async def main():
-    """Main function"""
-    print("="*60)
-    print("🔥 COMBINED PROXY CHECKER BOT - RENDER DEPLOYMENT")
-    print("="*60)
+    """Main function - Webhook mode only"""
+    print("=" * 60)
+    print("COMBINED PROXY CHECKER BOT - RENDER WEBHOOK DEPLOYMENT")
+    print("=" * 60)
     print(f"Token: {BOT_TOKEN[:10]}...{BOT_TOKEN[-10:]}")
     print(f"Admin IDs: {ADMIN_IDS}")
     print(f"Port: {PORT}")
-    print(f"Webhook URL: {WEBHOOK_URL or 'Not set (polling mode)'}")
-    print("="*60)
+    print(f"Webhook URL: {WEBHOOK_URL}")
+    print("=" * 60)
     
-    # Test connection
+    # Validate environment
+    print("Validating environment...")
+    if not WEBHOOK_URL.startswith(('http://', 'https://')):
+        print(f"ERROR: WEBHOOK_URL must start with http:// or https://")
+        return
+    
+    # Test bot connection
     if not test_bot_connection():
-        print("❌ Bot connection failed!")
+        print("Bot connection failed!")
         return
     
     # Setup bot
     if not await setup_bot():
-        print("❌ Bot setup failed!")
+        print("Bot setup failed!")
         return
     
-    print("🚀 Bot is running on Render!")
-    print("📱 Go to Telegram and send /start to your bot!")
+    print("Bot is running in webhook mode!")
+    print(f"Health check: {WEBHOOK_URL}/")
+    print(f"Webhook endpoint: {WEBHOOK_URL}/webhook")
+    print("Go to Telegram and send /start to your bot!")
     
-    # Start Flask app in background thread
-    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
-    flask_thread.start()
-    
-    # Keep the application running
-    try:
-        if WEBHOOK_URL:
-            print("🌐 Running in webhook mode...")
-            # In webhook mode, just keep the main thread alive
-            while True:
-                await asyncio.sleep(60)
-                # Health check
-                try:
-                    me = await bot_application.bot.get_me()
-                    if not me:
-                        print("❌ Bot connection lost!")
-                        break
-                except Exception as e:
-                    print(f"❌ Health check failed: {e}")
-        else:
-            print("🔄 Running in polling mode...")
-            # Start polling
-            await bot_application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
-            
-            # Keep running
-            while True:
-                await asyncio.sleep(10)
-                
-    except KeyboardInterrupt:
-        print("⏹️ Bot stopped by user")
-    except Exception as e:
-        print(f"❌ Runtime error: {e}")
-        traceback.print_exc()
-    
-    finally:
-        try:
-            print("🔄 Shutting down...")
-            if bot_application:
-                await bot_application.stop()
-                await bot_application.shutdown()
-            print("✅ Shutdown complete")
-        except Exception as e:
-            print(f"❌ Shutdown error: {e}")
+    # Run Flask server (this will block)
+    run_webhook_server()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        traceback.print_exc()
